@@ -17,6 +17,11 @@ export interface PredictionResult {
 
 export interface TrafficData {
   features: number[];
+  feature_names?: string[];
+  label?: string;
+  attack_frequency?: number;
+  frequency_level?: 'Low' | 'Medium' | 'High' | string;
+  time_window_seconds?: number;
 }
 
 export interface LogEntry {
