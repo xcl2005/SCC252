@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, computed, onBeforeUnmount } from 'vue';
 import { api } from './services/api';
-import { PerformanceMetrics, PredictionResult, LogEntry } from './types';
+import { PerformanceMetrics, PredictionResult, LogEntry, TrafficData } from './types';
 import StatCard from './components/StatCard.vue';
 import RadarChart from './components/RadarChart.vue';
 
@@ -16,6 +16,13 @@ const logs = ref<LogEntry[]>([
   { id: 2, timestamp: new Date().toLocaleTimeString(), message: "[SYSTEM] Connected to RF Model (78 features)...", type: "info" }
 ]);
 const fileInput = ref<HTMLInputElement | null>(null);
+const attackIntervalId = ref<number | null>(null);
+const selectedAttackFrequency = ref<number | null>(null);
+const attackTimeWindow = ref<number | null>(null);
+const isStartingStream = ref(false);
+const isStreamTicking = ref(false);
+
+const isStreamingAttack = computed(() => attackIntervalId.value !== null);
 
 // --- Actions ---
 
@@ -33,36 +40,58 @@ const loadPerformance = async () => {
   }
 };
 
-// Simulate Traffic
-const simulateTraffic = async (type: 'normal' | 'attack' | 'random') => {
-  isAnalyzing.value = true;
-  try {
-    // 1. Get Fake Data
-    const data = await api.getTrafficData(type);
-    
-    // 2. Predict
-    const result = await api.predict(data.features);
-    predictionResult.value = result;
-
-    // 3. Log
-    addLog(result);
-  } catch (error: any) {
-    console.error(error);
-    const msg = error.name === 'AbortError' 
-      ? "⚠️ Request Timed Out! Server took too long." 
-      : `❌ Error: ${error.message}`;
-    alert(msg);
-  } finally {
-    isAnalyzing.value = false;
+const stopAttackStream = (reason?: string) => {
+  if (attackIntervalId.value !== null) {
+    clearInterval(attackIntervalId.value);
+    attackIntervalId.value = null;
   }
+  if (reason) {
+    logs.value.unshift({
+      id: Date.now(),
+      timestamp: new Date().toLocaleTimeString(),
+      message: `[STREAM] ${reason}`,
+      type: 'info'
+    });
+  }
+  selectedAttackFrequency.value = null;
+  attackTimeWindow.value = null;
 };
 
-// Handle Log Adding
-const addLog = (res: PredictionResult) => {
+const addLog = (
+  res: PredictionResult,
+  context?: {
+    source?: 'normal' | 'attack' | 'random';
+    attack_frequency?: number | null;
+    frequency_level?: string;
+    label?: string;
+    time_window_seconds?: number | null;
+  }
+) => {
+  const source = context?.source;
+  const attackFrequency = context?.attack_frequency;
+  const frequencyLevel = context?.frequency_level;
+  const windowSeconds = context?.time_window_seconds;
+
+  let prefix = 'DETECTED:';
+  if (source === 'attack') {
+    const parts = ['[STREAM]'];
+    if (context?.label) parts.push(context.label);
+    if (attackFrequency) {
+      const tw = windowSeconds ?? 10;
+      parts.push(`@ ${attackFrequency}/${tw}s`);
+    }
+    if (frequencyLevel) parts.push(`(${frequencyLevel})`);
+    prefix = `${parts.join(' ').trim()} DETECTED:`;
+  } else if (source === 'random') {
+    prefix = '[PORTSCAN] DETECTED:';
+  } else if (source === 'normal') {
+    prefix = '[NORMAL] DETECTED:';
+  }
+
   const newLog: LogEntry = {
     id: Date.now(),
     timestamp: new Date().toLocaleTimeString(),
-    message: `DETECTED: `,
+    message: prefix,
     label: res.predicted_label,
     confidence: `(Conf: ${(res.confidence * 100).toFixed(1)}%)`,
     type: res.threat_level === 'None' ? 'success' : 'danger',
@@ -70,6 +99,109 @@ const addLog = (res: PredictionResult) => {
     probabilities: res.probabilities
   };
   logs.value.unshift(newLog); // Add to top
+};
+
+const runPredictionPipeline = async (
+  type: 'normal' | 'attack' | 'random',
+  data: TrafficData,
+  options: { skipLoading?: boolean } = {}
+) => {
+  if (!options.skipLoading) {
+    isAnalyzing.value = true;
+  }
+  try {
+    const result = await api.predict(data.features);
+    predictionResult.value = result;
+    addLog(result, {
+      source: type,
+      attack_frequency: data.attack_frequency,
+      frequency_level: data.frequency_level,
+      label: data.label,
+      time_window_seconds: data.time_window_seconds
+    });
+  } catch (error: any) {
+    console.error(error);
+    const msg = error.name === 'AbortError'
+      ? "⚠️ Request Timed Out! Server took too long."
+      : `❌ Error: ${error.message}`;
+    alert(msg);
+    if (type === 'attack') {
+      stopAttackStream('Attack stream stopped due to an error.');
+    }
+  } finally {
+    if (!options.skipLoading) {
+      isAnalyzing.value = false;
+    }
+  }
+};
+
+// Simulate Traffic (single run for normal/random)
+const simulateTraffic = async (type: 'normal' | 'random') => {
+  stopAttackStream();
+  try {
+    const data = await api.getTrafficData(type);
+    await runPredictionPipeline(type, data);
+  } catch (error: any) {
+    console.error(error);
+    const msg = error.name === 'AbortError'
+      ? "⚠️ Request Timed Out! Server took too long."
+      : `❌ Error: ${error.message}`;
+    alert(msg);
+  }
+};
+
+const computeAttackIntervalMs = (frequency?: number | null, windowSeconds?: number | null) => {
+  const freq = frequency && frequency > 0 ? frequency : 1;
+  const windowSec = windowSeconds && windowSeconds > 0 ? windowSeconds : 10;
+  return Math.max(500, Math.round((windowSec / freq) * 1000));
+};
+
+const startAttackStream = async () => {
+  stopAttackStream();
+  isStartingStream.value = true;
+  try {
+    const data = await api.getTrafficData('attack');
+
+    selectedAttackFrequency.value = data.attack_frequency ?? Math.max(1, Math.floor(Math.random() * 10) + 1);
+    attackTimeWindow.value = data.time_window_seconds ?? 10;
+
+    const initialPayload: TrafficData = {
+      ...data,
+      attack_frequency: selectedAttackFrequency.value,
+      time_window_seconds: attackTimeWindow.value
+    };
+
+    await runPredictionPipeline('attack', initialPayload);
+
+    const intervalMs = computeAttackIntervalMs(selectedAttackFrequency.value, attackTimeWindow.value);
+    attackIntervalId.value = window.setInterval(async () => {
+      if (isStreamTicking.value) return;
+      isStreamTicking.value = true;
+      try {
+        const streamData = await api.getTrafficData('attack');
+        const payload: TrafficData = {
+          ...streamData,
+          attack_frequency: selectedAttackFrequency.value ?? streamData.attack_frequency,
+          time_window_seconds: attackTimeWindow.value ?? streamData.time_window_seconds
+        };
+        await runPredictionPipeline('attack', payload, { skipLoading: true });
+      } catch (error: any) {
+        console.error(error);
+        stopAttackStream('Attack stream stopped due to an error.');
+      } finally {
+        isStreamTicking.value = false;
+      }
+    }, intervalMs);
+  } catch (error: any) {
+    console.error(error);
+    const msg = error.name === 'AbortError'
+      ? "⚠️ Request Timed Out! Server took too long."
+      : `❌ Error: ${error.message}`;
+    alert(msg);
+    stopAttackStream('Attack stream failed to start.');
+  } finally {
+    isStartingStream.value = false;
+  }
 };
 
 // Upload & Retrain
@@ -98,6 +230,10 @@ const handleRetrain = async () => {
 
 onMounted(() => {
   loadPerformance();
+});
+
+onBeforeUnmount(() => {
+  stopAttackStream();
 });
 </script>
 
@@ -154,27 +290,40 @@ onMounted(() => {
           <p class="text-gray-500 text-sm mb-4">Inject simulated packets to test IDS response.</p>
 
           <div class="space-y-3">
-            <button 
+            <button
               @click="simulateTraffic('normal')"
-              :disabled="isAnalyzing"
+              :disabled="isAnalyzing || isStartingStream"
               class="w-full py-2.5 px-4 bg-white border border-primary text-primary font-semibold uppercase tracking-wide hover:bg-primary hover:text-white transition-colors duration-300 rounded disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
               <i class="fas fa-check-circle"></i> Normal Traffic
             </button>
-            <button 
-              @click="simulateTraffic('random')" 
-              :disabled="isAnalyzing"
+            <button
+              @click="simulateTraffic('random')"
+              :disabled="isAnalyzing || isStartingStream"
               class="w-full py-2.5 px-4 bg-white border border-orange-400 text-orange-500 font-semibold uppercase tracking-wide hover:bg-orange-400 hover:text-white transition-colors duration-300 rounded disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
               <i class="fas fa-search-location"></i> PortScan Test
             </button>
-            <button 
-              @click="simulateTraffic('attack')"
-              :disabled="isAnalyzing"
+            <button
+              @click="startAttackStream"
+              :disabled="isAnalyzing || isStartingStream"
               class="w-full py-2.5 px-4 bg-white border border-red-500 text-red-500 font-semibold uppercase tracking-wide hover:bg-red-500 hover:text-white transition-colors duration-300 rounded disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
-              <i class="fas fa-biohazard"></i> DDoS Attack
+              <i class="fas fa-biohazard"></i> DDoS Attack Stream
             </button>
+
+            <div v-if="isStreamingAttack" class="rounded border border-red-200 bg-red-50 text-red-700 text-xs font-semibold px-3 py-2 mt-2 flex flex-col gap-1">
+              <span class="flex items-center gap-2">
+                <i class="fas fa-wave-square"></i>
+                Streaming attack traffic @ {{ selectedAttackFrequency || 1 }}/{{ attackTimeWindow || 10 }}s
+              </span>
+              <button
+                @click="stopAttackStream('Attack stream stopped by user.')"
+                class="self-start text-red-600 hover:text-red-800 underline text-xs"
+              >
+                Stop stream
+              </button>
+            </div>
           </div>
 
           <div v-if="isAnalyzing" class="mt-4 text-center text-primary font-bold animate-pulse text-sm">
